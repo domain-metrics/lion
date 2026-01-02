@@ -24,7 +24,62 @@ def submit_batch_and_monitor():
                 'example.com', 
                 'github.com',
                 'stackoverflow.com',
-                'reddit.com'
+                'reddit.com',
+                'elmleynaturereserve.co.uk',
+                'aooke-anime.com',
+                'freetronics.com.au',
+                'roell.net',
+                'tongitsfun.xyz',
+                'autoeurope.eu',
+                'thecarbonunderground.org',
+                'speedgoat.com',
+                'hotelunique.com',
+                'shareindia.com',
+                'techcrunch.com',
+                'example.com', 
+                'github.com',
+                'stackoverflow.com',
+                'reddit.com',
+                'elmleynaturereserve.co.uk',
+                'aooke-anime.com',
+                'freetronics.com.au',
+                'roell.net',
+                'tongitsfun.xyz',
+                'autoeurope.eu',
+                'thecarbonunderground.org',
+                'speedgoat.com',
+                'hotelunique.com',
+                'shareindia.com',
+                'techcrunch.com',
+                'example.com', 
+                'github.com',
+                'stackoverflow.com',
+                'reddit.com',
+                'elmleynaturereserve.co.uk',
+                'aooke-anime.com',
+                'freetronics.com.au',
+                'roell.net',
+                'tongitsfun.xyz',
+                'autoeurope.eu',
+                'thecarbonunderground.org',
+                'speedgoat.com',
+                'hotelunique.com',
+                'shareindia.com',
+                'techcrunch.com',
+                'example.com', 
+                'github.com',
+                'stackoverflow.com',
+                'reddit.com',
+                'elmleynaturereserve.co.uk',
+                'aooke-anime.com',
+                'freetronics.com.au',
+                'roell.net',
+                'tongitsfun.xyz',
+                'autoeurope.eu',
+                'thecarbonunderground.org',
+                'speedgoat.com',
+                'hotelunique.com',
+                'shareindia.com',
             ]
         }
     )
@@ -94,34 +149,13 @@ def submit_batch_and_monitor():
 
 def demo_queue_behavior():
     """Demonstrate queue behavior"""
-    print("=" * 80)
-    print("🧪 QUEUE SYSTEM DEMONSTRATION")
-    print("=" * 80)
-    print()
-    print("This demonstrates STAGGERED LOADING of domains:")
-    print("1. All 5 domains will be added to the queue instantly")
-    print("2. First domain starts loading immediately")
-    print("3. When page loads (network idle), NEXT domain starts loading")
-    print("4. Multiple domains scrape in parallel, but loading is staggered")
-    print()
-    print("Timeline Example:")
-    print("  0s:  Domain 1 starts loading")
-    print("  10s: Domain 1 page loaded → Domain 2 starts loading")
-    print("  20s: Domain 2 page loaded → Domain 3 starts loading")
-    print("  ... Domain 1 completes scraping")
-    print("  ... Domain 2 completes scraping")
-    print()
-    print("Benefits:")
-    print("✅ Not all pages load at once (prevents browser overload)")
-    print("✅ Multiple domains scraping in parallel (better throughput)")
-    print("✅ Staggered loading ensures stability")
-    print()
-    input("Press Enter to start...")
-    print()
     
     submit_batch_and_monitor()
 
 
 if __name__ == '__main__':
+    start_time = time.time()
     demo_queue_behavior()
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
 

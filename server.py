@@ -186,10 +186,6 @@ async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
         await page.goto(url, wait_until='networkidle', timeout=80000)
         print(f"🔍 Page loaded for {domain}")
         
-        # Trigger callback to start next domain
-        if page_loaded_callback:
-            await page_loaded_callback()
-        
         await asyncio.sleep(10)
         
         # Function to find and click CAPTCHA checkbox
@@ -457,8 +453,13 @@ async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
         first_captcha_found = await find_and_click_captcha('full_page', 1)
 
         if first_captcha_found:
-            await asyncio.sleep(7)
+            await asyncio.sleep(10)
             await page.wait_for_load_state('networkidle')
+        
+        # Trigger callback to start next domain (after first CAPTCHA handled)
+        print(f"✨ First CAPTCHA handled for {domain}, starting next task...")
+        if page_loaded_callback:
+            await page_loaded_callback()
 
         # CAPTCHA #2: Main Page CAPTCHA (appears on page, RIGHT-CENTER area)
         # Try this regardless of whether CAPTCHA #1 was found
@@ -466,11 +467,9 @@ async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
         second_captcha_found = await find_and_click_captcha('main_page', 2)
 
         if second_captcha_found:
-            await asyncio.sleep(7)
+            await asyncio.sleep(15)
+            await page.wait_for_load_state('networkidle')
         
-        # wait for network idle
-        await page.wait_for_load_state('networkidle')
-
         # Extract metrics
         metrics = await extract_metrics(page)
         # print(metrics)
