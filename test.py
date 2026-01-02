@@ -9,11 +9,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict
 import json
 
-MAC_SCRAPER_URL = "http://100.73.90.66:8000"
-MAC_SCRAPER_URL = "http://127.0.0.1:8000"
+MAC_SCRAPER_URL = "http://100.116.223.23:8000"
+# MAC_SCRAPER_URL = "http://127.0.0.1:8000"
 MAX_RETRIES = 600
 RETRY_DELAY = 10  # seconds
-MAX_THREADS = 1
+MAX_THREADS = 5
 
 def submit_job(domain: str) -> Optional[str]:
     """Submit a scraping job and return task_id"""
@@ -167,7 +167,7 @@ def main():
     for result in results[:5]:
         if result.get('status') == 'completed':
             print(f"\n{result.get('domain')}:")
-            print(f"  Domain Rating: {result.get('result', {}).get('domain_rating')}")
+            print(f"  Domain Rating: {result.get('result', {}).get('_dr')}")
             print(f"  Backlinks: {result.get('result', {}).get('backlinks')}")
             print(f"  Linking Websites: {result.get('result', {}).get('linking_websites')}")
 
