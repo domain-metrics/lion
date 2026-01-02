@@ -10,7 +10,7 @@ from typing import Optional, Dict
 import json
 
 MAC_SCRAPER_URL = "http://100.73.90.66:8000"
-# MAC_SCRAPER_URL = "http://127.0.0.1:8000"
+MAC_SCRAPER_URL = "http://127.0.0.1:8000"
 MAX_RETRIES = 600
 RETRY_DELAY = 10  # seconds
 MAX_THREADS = 1
