@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Access via Tailscale: http://100.124.226.72:8000
+
+Architecture:
+- Single persistent Camoufox browser instance (initialized on startup)
+- Each scrape request creates a new context + page within the same browser
+- Browser is reused across all requests for better performance
+- Browser is properly closed on server shutdown
 """
 
 from flask import Flask, request, jsonify
@@ -23,6 +29,48 @@ app = Flask(__name__)
 # In-memory storage for jobs and results
 jobs = {}
 results = {}
+
+# Global browser instance (will be initialized on startup)
+global_browser = None
+browser_lock = asyncio.Lock()
+
+# Global event loop for all async operations
+global_loop = None
+loop_thread = None
+
+async def initialize_browser():
+    """Initialize the global browser instance"""
+    global global_browser
+    
+    if global_browser is None:
+        print("🚀 Initializing Camoufox browser instance...")
+        global_browser = await AsyncCamoufox(
+            headless=False,
+            humanize=True,
+            screen=Screen(
+                min_width=1300,
+                max_width=1300,
+                min_height=768,
+                max_height=768
+            ),
+            window=(1300, 768),
+            i_know_what_im_doing=True,
+            config={'forceScopeAccess': True},
+            disable_coop=True,
+        ).__aenter__()
+        print("✅ Browser instance ready!")
+    
+    return global_browser
+
+async def close_browser():
+    """Close the global browser instance"""
+    global global_browser
+    
+    if global_browser is not None:
+        print("🔒 Closing browser instance...")
+        await global_browser.__aexit__(None, None, None)
+        global_browser = None
+        print("✅ Browser closed!")
 
 async def extract_metrics(page):
     metrics = await page.evaluate("""
@@ -89,23 +137,32 @@ async def extract_metrics(page):
         'linking_websites': convert_to_int(metrics['linking_websites'])
     }
 
-async def scrape_complete(domain):
-    async with AsyncCamoufox(
-        headless=False,
-        humanize=True,
-        screen=Screen(
-            min_width=1300,
-            max_width=1300,
-            min_height=768,
-            max_height=768
-        ),
-        window=(1300, 768),
-        i_know_what_im_doing=True,
-        config={'forceScopeAccess': True},
-        disable_coop=True,
-    ) as browser:
-        context = await browser.new_context()
-        page = await context.new_page()
+async def scrape_complete(domain, proxy=None):
+    """Scrape domain using the global browser instance (creates new page)
+    
+    Args:
+        domain: Domain to scrape
+        proxy: Dict with keys: server, username, password (optional)
+    """
+    global global_browser
+    
+    # Ensure browser is initialized
+    if global_browser is None:
+        await initialize_browser()
+    else:
+        print(f"♻️  Reusing existing browser instance for {domain}")
+    
+    # Create a new context with optional proxy
+    context_options = {}
+    if proxy:
+        context_options['proxy'] = proxy
+        print(f"🔒 Using proxy: {proxy.get('server')} for {domain}")
+    
+    context = await global_browser.new_context(**context_options)
+    page = await context.new_page()
+    print(f"📄 New page created for {domain}")
+    
+    try:
         # Decode base64 text to string
         _url = 'aHR0cHM6Ly9haHJlZnMuY29tL3dlYnNpdGUtYXV0aG9yaXR5LWNoZWNrZXI/aW5wdXQ9'
         _url = base64.b64decode(_url).decode('utf-8')
@@ -401,22 +458,21 @@ async def scrape_complete(domain):
             'linking_websites': metrics['linking_websites']
         }
         
-        await context.close()
-        await browser.close()
-        
         return result
+        
+    finally:
+        # Always close the page and context (keep browser open for reuse)
+        print(f"🧹 Cleaning up page and context for {domain}")
+        await page.close()
+        await context.close()
 
-def run_async_scrape(task_id, domain):
-    """Run async scrape in a new event loop"""
+async def async_scrape_wrapper(task_id, domain, proxy=None):
+    """Async wrapper for scraping - runs in global event loop"""
     try:
         jobs[task_id]['status'] = 'processing'
         jobs[task_id]['started_at'] = datetime.now().isoformat()
         
-        # Create new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        result = loop.run_until_complete(scrape_complete(domain))
+        result = await scrape_complete(domain, proxy)
         
         jobs[task_id]['status'] = 'completed'
         jobs[task_id]['completed_at'] = datetime.now().isoformat()
@@ -429,6 +485,19 @@ def run_async_scrape(task_id, domain):
         jobs[task_id]['error'] = str(e)
         jobs[task_id]['completed_at'] = datetime.now().isoformat()
         print(f"❌ Task {task_id} failed: {e}")
+
+def run_async_scrape(task_id, domain, proxy=None):
+    """Submit scrape task to the global event loop"""
+    global global_loop
+    
+    if global_loop is None:
+        print(f"❌ Global event loop not initialized!")
+        jobs[task_id]['status'] = 'failed'
+        jobs[task_id]['error'] = 'Event loop not initialized'
+        return
+    
+    # Submit the coroutine to the global event loop running in background thread
+    asyncio.run_coroutine_threadsafe(async_scrape_wrapper(task_id, domain, proxy), global_loop)
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -445,7 +514,15 @@ def health():
 
 @app.route('/scrape', methods=['POST'])
 def scrape():
-    """Submit a scraping job"""
+    """Submit a scraping job
+    
+    Request body:
+        domain (required): Domain to scrape
+        proxy_ip (optional): Proxy IP address
+        proxy_port (optional): Proxy port
+        proxy_user (optional): Proxy username
+        proxy_pass (optional): Proxy password
+    """
     data = request.get_json()
     
     if not data or 'domain' not in data:
@@ -454,6 +531,19 @@ def scrape():
     domain = data['domain']
     task_id = str(uuid.uuid4())
     
+    # Build proxy dict if proxy parameters provided
+    proxy = None
+    if 'proxy_ip' in data and 'proxy_port' in data:
+        proxy_server = f"http://{data['proxy_ip']}:{data['proxy_port']}"
+        proxy = {
+            'server': proxy_server
+        }
+        
+        # Add authentication if provided
+        if 'proxy_user' in data and 'proxy_pass' in data:
+            proxy['username'] = data['proxy_user']
+            proxy['password'] = data['proxy_pass']
+    
     # Store job info
     jobs[task_id] = {
         'task_id': task_id,
@@ -461,20 +551,22 @@ def scrape():
         'status': 'pending',
         'created_at': datetime.now().isoformat(),
         'started_at': None,
-        'completed_at': None
+        'completed_at': None,
+        'proxy': proxy_server if proxy else None
     }
     
     # Start scraping in background thread
-    thread = Thread(target=run_async_scrape, args=(task_id, domain))
+    thread = Thread(target=run_async_scrape, args=(task_id, domain, proxy))
     thread.daemon = True
     thread.start()
     
-    print(f"📥 New job {task_id}: {domain}")
+    print(f"📥 New job {task_id}: {domain}" + (f" [proxy: {proxy_server}]" if proxy else ""))
     
     return jsonify({
         'task_id': task_id,
         'domain': domain,
         'status': 'pending',
+        'proxy': proxy_server if proxy else None,
         'message': 'Job submitted successfully'
     }), 202
 
@@ -519,7 +611,13 @@ def list_jobs():
 
 @app.route('/batch', methods=['POST'])
 def batch_scrape():
-    """Submit multiple domains at once"""
+    """Submit multiple domains at once
+    
+    Request body:
+        domains (required): List of domains (strings) or list of objects with:
+            - domain (required)
+            - proxy_ip, proxy_port, proxy_user, proxy_pass (optional)
+    """
     data = request.get_json()
     
     if not data or 'domains' not in data:
@@ -532,7 +630,31 @@ def batch_scrape():
     
     task_ids = []
     
-    for domain in domains:
+    for item in domains:
+        # Support both string domains and object with domain + proxy
+        if isinstance(item, str):
+            domain = item
+            proxy = None
+        elif isinstance(item, dict):
+            domain = item.get('domain')
+            if not domain:
+                continue  # Skip items without domain
+            
+            # Build proxy dict if proxy parameters provided
+            proxy = None
+            if 'proxy_ip' in item and 'proxy_port' in item:
+                proxy_server = f"http://{item['proxy_ip']}:{item['proxy_port']}"
+                proxy = {
+                    'server': proxy_server
+                }
+                
+                # Add authentication if provided
+                if 'proxy_user' in item and 'proxy_pass' in item:
+                    proxy['username'] = item['proxy_user']
+                    proxy['password'] = item['proxy_pass']
+        else:
+            continue  # Skip invalid items
+        
         task_id = str(uuid.uuid4())
         
         jobs[task_id] = {
@@ -541,26 +663,67 @@ def batch_scrape():
             'status': 'pending',
             'created_at': datetime.now().isoformat(),
             'started_at': None,
-            'completed_at': None
+            'completed_at': None,
+            'proxy': proxy.get('server') if proxy else None
         }
         
-        thread = Thread(target=run_async_scrape, args=(task_id, domain))
+        thread = Thread(target=run_async_scrape, args=(task_id, domain, proxy))
         thread.daemon = True
         thread.start()
         
         task_ids.append(task_id)
     
-    print(f"📥 Batch job: {len(domains)} domains")
+    print(f"📥 Batch job: {len(task_ids)} domains")
     
     return jsonify({
-        'message': f'{len(domains)} jobs submitted',
+        'message': f'{len(task_ids)} jobs submitted',
         'task_ids': task_ids
     }), 202
+
+def run_event_loop(loop):
+    """Run event loop in background thread"""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def startup():
+    """Initialize browser and event loop on startup"""
+    global global_loop, loop_thread
+    
+    print("🔧 Starting global event loop in background thread...")
+    
+    # Create event loop and run it in background thread
+    global_loop = asyncio.new_event_loop()
+    loop_thread = Thread(target=run_event_loop, args=(global_loop,), daemon=True)
+    loop_thread.start()
+    
+    print("✅ Event loop started!")
+    
+    # Initialize browser in that loop
+    future = asyncio.run_coroutine_threadsafe(initialize_browser(), global_loop)
+    future.result(timeout=30)  # Wait for browser to initialize
+    
+    print("✅ Startup complete!")
 
 if __name__ == '__main__':
     print("📍 Tailscale IP: 100.124.226.72")
     print("🌐 Access from K8s: http://100.124.226.72:8000")
     print("")
     
-    # Run on all interfaces so Tailscale can access
-    app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
+    # Initialize browser before starting server
+    startup()
+    
+    try:
+        # Run on all interfaces so Tailscale can access
+        app.run(host='0.0.0.0', port=8000, debug=False, threaded=True)
+    finally:
+        # Cleanup on shutdown
+        print("\n🛑 Shutting down...")
+        if global_loop and global_loop.is_running():
+            # Close browser in the global loop
+            future = asyncio.run_coroutine_threadsafe(close_browser(), global_loop)
+            future.result(timeout=10)
+            
+            # Stop the event loop
+            global_loop.call_soon_threadsafe(global_loop.stop)
+            loop_thread.join(timeout=5)
+            print("✅ Cleanup complete!")

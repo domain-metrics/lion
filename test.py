@@ -9,25 +9,37 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict
 import json
 
-MAC_SCRAPER_URL = "http://100.116.223.23:8000"
-# MAC_SCRAPER_URL = "http://127.0.0.1:8000"
+# MAC_SCRAPER_URL = "http://100.116.223.23:8000"
+MAC_SCRAPER_URL = "http://127.0.0.1:8000"
 MAX_RETRIES = 600
 RETRY_DELAY = 10  # seconds
-MAX_THREADS = 5
+MAX_THREADS = 1
 
-def submit_job(domain: str) -> Optional[str]:
-    """Submit a scraping job and return task_id"""
+def submit_job(domain: str, proxy: Optional[Dict] = None) -> Optional[str]:
+    """Submit a scraping job and return task_id
+    
+    Args:
+        domain: Domain to scrape
+        proxy: Optional dict with keys: proxy_ip, proxy_port, proxy_user, proxy_pass
+    """
     try:
+        payload = {'domain': domain}
+        
+        # Add proxy parameters if provided
+        if proxy:
+            payload.update(proxy)
+        
         response = requests.post(
             f"{MAC_SCRAPER_URL}/scrape",
-            json={'domain': domain},
+            json=payload,
             timeout=30
         )
         response.raise_for_status()
         
         data = response.json()
         task_id = data.get('task_id')
-        print(f"✅ Submitted: {domain} -> {task_id}")
+        proxy_info = f" [proxy: {proxy.get('proxy_ip')}]" if proxy else ""
+        print(f"✅ Submitted: {domain}{proxy_info} -> {task_id}")
         return task_id
         
     except Exception as e:
