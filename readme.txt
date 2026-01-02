@@ -77,5 +77,19 @@ curl http://127.0.0.1:8000/jobs
 # Test 8: List only completed jobs
 curl "http://127.0.0.1:8000/jobs?status=completed"
 
-# Test 9: Check server health
+# Test 9: Check current queue status
+curl http://127.0.0.1:8000/queue
+
+# Test 10: Check server health
 curl http://127.0.0.1:8000/health
+
+# ========================================
+# NOTES
+# ========================================
+# - All jobs are processed through a queue with staggered loading
+# - When you submit a batch, domains are added to a queue
+# - First domain starts loading immediately
+# - When page loads (network idle), next domain starts automatically
+# - Multiple domains can be scraping in parallel, but loading is staggered
+# - This prevents browser overload (not 10 pages loading at once)
+# - Job status flow: queued -> processing -> completed/failed

@@ -6,7 +6,17 @@ Architecture:
 - Single persistent Camoufox browser instance (initialized on startup)
 - Each scrape request creates a new context + page within the same browser
 - Browser is reused across all requests for better performance
+- Tasks are processed through a queue with staggered loading
+- Next domain starts loading as soon as current page is loaded
 - Browser is properly closed on server shutdown
+
+Queue System:
+- All scrape requests are added to a queue
+- First domain starts immediately
+- When its page loads (network idle), next domain starts automatically
+- Multiple domains can be scraping simultaneously, but loading is staggered
+- This prevents browser overload while maintaining throughput
+- Status flow: queued -> processing -> completed/failed
 """
 
 from flask import Flask, request, jsonify
@@ -37,6 +47,10 @@ browser_lock = asyncio.Lock()
 # Global event loop for all async operations
 global_loop = None
 loop_thread = None
+
+# Task queue for staggered processing
+task_queue = []
+queue_lock = asyncio.Lock()
 
 async def initialize_browser():
     """Initialize the global browser instance"""
@@ -137,12 +151,13 @@ async def extract_metrics(page):
         'linking_websites': convert_to_int(metrics['linking_websites'])
     }
 
-async def scrape_complete(domain, proxy=None):
+async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
     """Scrape domain using the global browser instance (creates new page)
     
     Args:
         domain: Domain to scrape
         proxy: Dict with keys: server, username, password (optional)
+        page_loaded_callback: Optional callback to call when page is loaded
     """
     global global_browser
     
@@ -170,6 +185,11 @@ async def scrape_complete(domain, proxy=None):
         url = f'{_url}{domain}'
         await page.goto(url, wait_until='networkidle', timeout=80000)
         print(f"🔍 Page loaded for {domain}")
+        
+        # Trigger callback to start next domain
+        if page_loaded_callback:
+            await page_loaded_callback()
+        
         await asyncio.sleep(10)
         
         # Function to find and click CAPTCHA checkbox
@@ -438,6 +458,7 @@ async def scrape_complete(domain, proxy=None):
 
         if first_captcha_found:
             await asyncio.sleep(7)
+            await page.wait_for_load_state('networkidle')
 
         # CAPTCHA #2: Main Page CAPTCHA (appears on page, RIGHT-CENTER area)
         # Try this regardless of whether CAPTCHA #1 was found
@@ -447,6 +468,9 @@ async def scrape_complete(domain, proxy=None):
         if second_captcha_found:
             await asyncio.sleep(7)
         
+        # wait for network idle
+        await page.wait_for_load_state('networkidle')
+
         # Extract metrics
         metrics = await extract_metrics(page)
         # print(metrics)
@@ -466,13 +490,36 @@ async def scrape_complete(domain, proxy=None):
         await page.close()
         await context.close()
 
-async def async_scrape_wrapper(task_id, domain, proxy=None):
-    """Async wrapper for scraping - runs in global event loop"""
+async def process_next_task():
+    """Process one task from the queue"""
+    global task_queue
+    
+    # Get next task
+    async with queue_lock:
+        if len(task_queue) == 0:
+            print("📭 Queue empty - no more tasks")
+            return
+        
+        task = task_queue.pop(0)
+        task_id = task['task_id']
+        domain = task['domain']
+        proxy = task.get('proxy')
+    
+    # Process this task
+    print(f"🔄 Processing from queue: {domain} (Queue size: {len(task_queue)})")
+    
+    # Callback to trigger next task when page loads
+    async def on_page_loaded():
+        print(f"✨ Page loaded for {domain}, starting next task...")
+        # Start next task immediately
+        asyncio.create_task(process_next_task())
+    
     try:
         jobs[task_id]['status'] = 'processing'
         jobs[task_id]['started_at'] = datetime.now().isoformat()
         
-        result = await scrape_complete(domain, proxy)
+        # Pass callback - next task starts when page loads, not when scraping completes
+        result = await scrape_complete(domain, proxy, page_loaded_callback=on_page_loaded)
         
         jobs[task_id]['status'] = 'completed'
         jobs[task_id]['completed_at'] = datetime.now().isoformat()
@@ -485,9 +532,35 @@ async def async_scrape_wrapper(task_id, domain, proxy=None):
         jobs[task_id]['error'] = str(e)
         jobs[task_id]['completed_at'] = datetime.now().isoformat()
         print(f"❌ Task {task_id} failed: {e}")
+        
+        # Still trigger next task even if this one failed
+        asyncio.create_task(process_next_task())
+
+async def add_task_to_queue(task_id, domain, proxy=None):
+    """Add a task to the queue and start processing if needed"""
+    global task_queue
+    
+    # Check if queue is empty before adding
+    async with queue_lock:
+        was_empty = len(task_queue) == 0
+        task_queue.append({
+            'task_id': task_id,
+            'domain': domain,
+            'proxy': proxy
+        })
+        queue_size = len(task_queue)
+    
+    print(f"📥 Added to queue: {domain} (Queue size: {queue_size})")
+    
+    # If queue was empty (no tasks processing), start processing this one
+    if was_empty:
+        print(f"🚀 Queue was empty, starting task immediately")
+        asyncio.create_task(process_next_task())
+    else:
+        print(f"⏳ Task added to queue, will start when previous page loads")
 
 def run_async_scrape(task_id, domain, proxy=None):
-    """Submit scrape task to the global event loop"""
+    """Submit scrape task to the queue via global event loop"""
     global global_loop
     
     if global_loop is None:
@@ -496,8 +569,8 @@ def run_async_scrape(task_id, domain, proxy=None):
         jobs[task_id]['error'] = 'Event loop not initialized'
         return
     
-    # Submit the coroutine to the global event loop running in background thread
-    asyncio.run_coroutine_threadsafe(async_scrape_wrapper(task_id, domain, proxy), global_loop)
+    # Add task to queue (will be processed sequentially)
+    asyncio.run_coroutine_threadsafe(add_task_to_queue(task_id, domain, proxy), global_loop)
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -506,10 +579,28 @@ def health():
         'status': 'healthy',
         'tailscale_ip': '100.124.226.72',
         'total_jobs': len(jobs),
-        'pending': len([j for j in jobs.values() if j['status'] == 'pending']),
+        'queued': len([j for j in jobs.values() if j['status'] == 'queued']),
         'processing': len([j for j in jobs.values() if j['status'] == 'processing']),
         'completed': len([j for j in jobs.values() if j['status'] == 'completed']),
-        'failed': len([j for j in jobs.values() if j['status'] == 'failed'])
+        'failed': len([j for j in jobs.values() if j['status'] == 'failed']),
+        'queue_size': len(task_queue)
+    })
+
+@app.route('/queue', methods=['GET'])
+def queue_status():
+    """Get current queue status"""
+    queue_items = []
+    for task in task_queue:
+        queue_items.append({
+            'task_id': task['task_id'],
+            'domain': task['domain'],
+            'has_proxy': task.get('proxy') is not None
+        })
+    
+    return jsonify({
+        'queue_size': len(task_queue),
+        'processing_count': len([j for j in jobs.values() if j['status'] == 'processing']),
+        'queue': queue_items
     })
 
 @app.route('/scrape', methods=['POST'])
@@ -548,14 +639,14 @@ def scrape():
     jobs[task_id] = {
         'task_id': task_id,
         'domain': domain,
-        'status': 'pending',
+        'status': 'queued',
         'created_at': datetime.now().isoformat(),
         'started_at': None,
         'completed_at': None,
         'proxy': proxy_server if proxy else None
     }
     
-    # Start scraping in background thread
+    # Add to queue (will be processed sequentially)
     thread = Thread(target=run_async_scrape, args=(task_id, domain, proxy))
     thread.daemon = True
     thread.start()
@@ -565,9 +656,9 @@ def scrape():
     return jsonify({
         'task_id': task_id,
         'domain': domain,
-        'status': 'pending',
+        'status': 'queued',
         'proxy': proxy_server if proxy else None,
-        'message': 'Job submitted successfully'
+        'message': 'Job queued successfully'
     }), 202
 
 @app.route('/result/<task_id>', methods=['GET'])
@@ -660,7 +751,7 @@ def batch_scrape():
         jobs[task_id] = {
             'task_id': task_id,
             'domain': domain,
-            'status': 'pending',
+            'status': 'queued',
             'created_at': datetime.now().isoformat(),
             'started_at': None,
             'completed_at': None,
@@ -673,10 +764,10 @@ def batch_scrape():
         
         task_ids.append(task_id)
     
-    print(f"📥 Batch job: {len(task_ids)} domains")
+    print(f"📥 Batch job: {len(task_ids)} domains queued")
     
     return jsonify({
-        'message': f'{len(task_ids)} jobs submitted',
+        'message': f'{len(task_ids)} jobs queued (will be processed sequentially)',
         'task_ids': task_ids
     }), 202
 
