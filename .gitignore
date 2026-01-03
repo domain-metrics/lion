@@ -1,2 +1,6 @@
 .venv/
 scraping_results_*.json
+# Queue, Results, and Worker files (dynamic data)
+queue/task_queue.json
+results/results.json
+worker/worker_*_heartbeat.json

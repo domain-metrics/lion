@@ -2,28 +2,46 @@
 """
 Worker - Processes tasks from queue
 Separate process that handles browser automation
+Each worker can be assigned a dedicated proxy
 """
 
 import asyncio
 import json
 import time
+import os
+import signal
+import sys
+import argparse
 from datetime import datetime
 from pathlib import Path
-import sys
 
 # Import helpers
 from camoufox_helper import initialize_browser, close_browser, get_or_create_context, create_page_in_context
 import cv2
 import numpy as np
 
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Worker process for browser automation')
+parser.add_argument('--proxy', type=str, default=None, help='Proxy in format: ip:port:user:pass')
+args = parser.parse_args()
+
 # Configuration
 MAX_CONCURRENT_PROCESSING = 1
 DEBUG = False
 MAX_TIMEOUT_ERRORS = 5
-QUEUE_FILE = "task_queue.json"
-RESULTS_FILE = "results.json"
-STATUS_FILE = "worker_status.json"
+QUEUE_DIR = "queue"
+RESULTS_DIR = "results"
+WORKER_DIR = "worker"
+QUEUE_FILE = f"{QUEUE_DIR}/task_queue.json"
+RESULTS_FILE = f"{RESULTS_DIR}/results.json"
 POLL_INTERVAL = 2  # seconds
+HEARTBEAT_INTERVAL = 10  # seconds
+HEARTBEAT_TIMEOUT = 30  # seconds (consider worker dead if heartbeat older than this)
+
+# Worker PID (Process ID) and Proxy
+WORKER_PID = os.getpid()
+WORKER_PROXY = args.proxy  # Proxy assigned to this worker
+HEARTBEAT_FILE = f"{WORKER_DIR}/worker_{WORKER_PID}_heartbeat.json"
 
 # Error tracking
 timeout_error_count = 0
@@ -45,12 +63,43 @@ def save_json_file(filename, data):
         json.dump(data, f, indent=2)
     Path(temp_file).replace(filename)
 
-def update_worker_status(status_info):
-    """Update worker status file"""
-    save_json_file(STATUS_FILE, {
-        **status_info,
-        'last_heartbeat': datetime.now().isoformat()
-    })
+def update_heartbeat():
+    """Update this worker's heartbeat file"""
+    heartbeat_data = {
+        'pid': WORKER_PID,
+        'proxy': WORKER_PROXY,  # Include proxy info in heartbeat
+        'timestamp': time.time(),
+        'last_updated': datetime.now().isoformat()
+    }
+    save_json_file(HEARTBEAT_FILE, heartbeat_data)
+
+def cleanup_heartbeat():
+    """Remove this worker's heartbeat file"""
+    try:
+        if Path(HEARTBEAT_FILE).exists():
+            Path(HEARTBEAT_FILE).unlink()
+            print(f"🧹 Cleaned up heartbeat file: {HEARTBEAT_FILE}")
+    except Exception as e:
+        print(f"⚠️  Failed to cleanup heartbeat: {e}")
+
+def count_active_workers():
+    """Count active workers based on heartbeat files"""
+    active_count = 0
+    current_time = time.time()
+    
+    # Find all worker heartbeat files in worker directory
+    for heartbeat_file in Path(WORKER_DIR).glob('worker_*_heartbeat.json'):
+        try:
+            heartbeat_data = load_json_file(str(heartbeat_file), {})
+            timestamp = heartbeat_data.get('timestamp', 0)
+            
+            # Check if heartbeat is recent
+            if current_time - timestamp < HEARTBEAT_TIMEOUT:
+                active_count += 1
+        except:
+            pass
+    
+    return active_count
 
 async def extract_metrics(page):
     """Extract DR, backlinks, and linking websites from Ahrefs page"""
@@ -302,8 +351,8 @@ async def find_and_click_captcha(page, captcha_type):
             print(f"   ⚠️  CAPTCHA detection error ({captcha_type}): {str(e)[:100]}")
         return False
 
-async def process_domain(domain, proxy=None):
-    """Process a single domain"""
+async def process_domain(domain):
+    """Process a single domain using worker's assigned proxy"""
     global timeout_error_count
     start_time = time.time()
     
@@ -311,11 +360,23 @@ async def process_domain(domain, proxy=None):
         if DEBUG:
             print(f"[{domain}] 🔄 Starting page load...")
         
+        # Use worker's proxy (if assigned)
+        proxy = None
+        if WORKER_PROXY:
+            # Parse proxy string: ip:port:user:pass
+            parts = WORKER_PROXY.split(':')
+            if len(parts) >= 4:
+                proxy = {
+                    'server': f"http://{parts[0]}:{parts[1]}",
+                    'username': parts[2],
+                    'password': parts[3]
+                }
+        
         context = await get_or_create_context(proxy)
         page = await create_page_in_context(context, domain)
         
         try:
-            try_count = 3
+            try_count = 10
             for attempt in range(try_count):
                 try:
                     url = f"https://ahrefs.com/website-authority-checker/?input={domain}"
@@ -412,21 +473,28 @@ async def process_tasks():
     """Main worker loop"""
     global timeout_error_count
     
-    print("🚀 Initializing browser...")
+    print(f"🚀 Initializing browser (PID: {WORKER_PID})...")
     await initialize_browser()
     print("✅ Browser ready!")
+    
+    # Initial heartbeat
+    update_heartbeat()
+    last_heartbeat = time.time()
     
     currently_processing = []
     restart_needed = False
     
     while True:
         try:
-            # Update worker status
-            update_worker_status({
-                'status': 'running',
-                'processing_count': len(currently_processing),
-                'timeout_errors': timeout_error_count
-            })
+            # Update heartbeat every HEARTBEAT_INTERVAL seconds
+            if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                update_heartbeat()
+                last_heartbeat = time.time()
+                
+                # Count active workers
+                active_workers = count_active_workers()
+                if DEBUG:
+                    print(f"💓 Heartbeat updated | Active workers: {active_workers}")
             
             # Check if restart needed
             if restart_needed and len(currently_processing) == 0:
@@ -462,9 +530,8 @@ async def process_tasks():
                 async def process_and_save(task_data):
                     nonlocal restart_needed
                     domain = task_data['domain']
-                    proxy = task_data.get('proxy')
                     
-                    result = await process_domain(domain, proxy)
+                    result = await process_domain(domain)
                     
                     # Check if restart needed
                     if result.get('restart_needed'):
@@ -501,20 +568,37 @@ async def process_tasks():
     
     print("🔒 Closing browser...")
     await close_browser()
+    cleanup_heartbeat()
     print("✅ Worker stopped!")
 
 if __name__ == '__main__':
     print("=" * 80)
-    print("🚀 Starting Worker (Task Processor)")
+    print(f"🚀 Starting Worker (Task Processor) - PID: {WORKER_PID}")
+    if WORKER_PROXY:
+        print(f"🔒 Proxy: {WORKER_PROXY[:30]}...")
+    else:
+        print(f"🌐 No proxy (direct connection)")
     print("=" * 80)
     print(f"Max concurrent: {MAX_CONCURRENT_PROCESSING}")
     print(f"Queue file: {QUEUE_FILE}")
     print(f"Results file: {RESULTS_FILE}")
     print(f"Poll interval: {POLL_INTERVAL}s")
+    print(f"Heartbeat file: {HEARTBEAT_FILE}")
     print("=" * 80)
+    
+    # Setup signal handlers for cleanup
+    def signal_handler(sig, frame):
+        print("\n⚠️  Received termination signal...")
+        cleanup_heartbeat()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         asyncio.run(process_tasks())
     except KeyboardInterrupt:
         print("\n✅ Worker stopped by user")
+        cleanup_heartbeat()
+
 

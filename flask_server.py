@@ -6,6 +6,8 @@ Receives requests and adds them to a shared queue (Redis or file-based)
 
 import json
 import time
+import subprocess
+import os
 from datetime import datetime
 from flask import Flask, jsonify, request
 from pathlib import Path
@@ -13,9 +15,17 @@ from pathlib import Path
 app = Flask(__name__)
 
 # Configuration
-QUEUE_FILE = "task_queue.json"
-RESULTS_FILE = "results.json"
-STATUS_FILE = "worker_status.json"
+QUEUE_DIR = "queue"
+RESULTS_DIR = "results"
+WORKER_DIR = "worker"
+QUEUE_FILE = f"{QUEUE_DIR}/task_queue.json"
+RESULTS_FILE = f"{RESULTS_DIR}/results.json"
+HEARTBEAT_TIMEOUT = 30  # seconds (consider worker dead if heartbeat older than this)
+
+# Create directories if they don't exist
+Path(QUEUE_DIR).mkdir(exist_ok=True)
+Path(RESULTS_DIR).mkdir(exist_ok=True)
+Path(WORKER_DIR).mkdir(exist_ok=True)
 
 def load_json_file(filename, default=None):
     """Load JSON file safely"""
@@ -46,6 +56,35 @@ def parse_proxy(proxy_string):
         }
     return None
 
+def count_active_workers():
+    """Count active workers based on heartbeat files"""
+    active_count = 0
+    current_time = time.time()
+    
+    # Find all worker heartbeat files in worker directory
+    for heartbeat_file in Path(WORKER_DIR).glob('worker_*_heartbeat.json'):
+        try:
+            heartbeat_data = load_json_file(str(heartbeat_file), {})
+            timestamp = heartbeat_data.get('timestamp', 0)
+            pid = heartbeat_data.get('pid')
+            
+            # Check if heartbeat is recent
+            if current_time - timestamp < HEARTBEAT_TIMEOUT and pid:
+                # Verify the process actually exists
+                try:
+                    os.kill(pid, 0)  # Signal 0 doesn't kill, just checks if process exists
+                    active_count += 1
+                except (ProcessLookupError, PermissionError):
+                    # Process doesn't exist, remove stale heartbeat file
+                    try:
+                        Path(heartbeat_file).unlink()
+                    except:
+                        pass
+        except:
+            pass
+    
+    return active_count
+
 # ============================================================================
 # Flask Routes
 # ============================================================================
@@ -59,18 +98,12 @@ def load_domain():
     if not domain:
         return jsonify({'error': 'domain is required'}), 400
     
-    # Parse proxy if provided
-    proxy = None
-    if data.get('proxy'):
-        proxy = parse_proxy(data['proxy'])
-    
     # Load current queue
     queue = load_json_file(QUEUE_FILE, [])
     
-    # Add task
+    # Add task (no proxy - workers have their own proxies)
     task = {
         'domain': domain,
-        'proxy': proxy,
         'added_at': datetime.now().isoformat(),
         'status': 'queued'
     }
@@ -95,20 +128,14 @@ def batch_load():
     if not domains:
         return jsonify({'error': 'domains array is required'}), 400
     
-    # Parse proxy if provided (same proxy for all domains)
-    proxy = None
-    if data.get('proxy'):
-        proxy = parse_proxy(data['proxy'])
-    
     # Load current queue
     queue = load_json_file(QUEUE_FILE, [])
     
-    # Add all domains
+    # Add all domains (no proxy - workers have their own proxies)
     added = []
     for domain in domains:
         task = {
             'domain': domain,
-            'proxy': proxy,
             'added_at': datetime.now().isoformat(),
             'status': 'queued'
         }
@@ -130,7 +157,6 @@ def get_queue_status():
     """Get current queue status"""
     queue = load_json_file(QUEUE_FILE, [])
     results = load_json_file(RESULTS_FILE, {'completed': [], 'failed': []})
-    worker_status = load_json_file(STATUS_FILE, {})
     
     queued_domains = [task['domain'] for task in queue if task.get('status') == 'queued']
     processing_domains = [task['domain'] for task in queue if task.get('status') == 'processing']
@@ -141,8 +167,7 @@ def get_queue_status():
         'queued_domains': queued_domains,
         'processing_domains': processing_domains,
         'completed_count': len(results.get('completed', [])),
-        'failed_count': len(results.get('failed', [])),
-        'worker_status': worker_status
+        'failed_count': len(results.get('failed', []))
     })
 
 
@@ -186,14 +211,179 @@ def clear_queue():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check"""
-    worker_status = load_json_file(STATUS_FILE, {})
-    
     return jsonify({
         'status': 'healthy',
-        'server': 'running',
-        'worker_status': worker_status.get('status', 'unknown'),
-        'worker_last_heartbeat': worker_status.get('last_heartbeat', 'unknown')
+        'server': 'running'
     })
+
+
+@app.route('/workers', methods=['GET'])
+def get_workers():
+    """Get active worker count"""
+    active_workers = count_active_workers()
+    
+    return jsonify({
+        'active_workers': active_workers
+    })
+
+
+@app.route('/workers/details', methods=['GET'])
+def get_workers_details():
+    """Get detailed worker information including proxies"""
+    workers = []
+    current_time = time.time()
+    
+    for heartbeat_file in Path(WORKER_DIR).glob('worker_*_heartbeat.json'):
+        try:
+            heartbeat_data = load_json_file(str(heartbeat_file), {})
+            timestamp = heartbeat_data.get('timestamp', 0)
+            pid = heartbeat_data.get('pid')
+            proxy = heartbeat_data.get('proxy')
+            
+            # Check if heartbeat is recent and process exists
+            if current_time - timestamp < HEARTBEAT_TIMEOUT and pid:
+                try:
+                    os.kill(pid, 0)  # Check if process exists
+                    workers.append({
+                        'pid': pid,
+                        'proxy': proxy if proxy else 'no proxy',
+                        'last_heartbeat': heartbeat_data.get('last_updated'),
+                        'age_seconds': int(current_time - timestamp)
+                    })
+                except (ProcessLookupError, PermissionError):
+                    pass
+        except:
+            pass
+    
+    return jsonify({
+        'active_workers': len(workers),
+        'workers': workers
+    })
+
+
+@app.route('/scale', methods=['GET', 'POST'])
+def scale_workers():
+    """Start or kill workers based on scale parameter
+    
+    GET /scale?scale=3  - Scale to 3 workers (no proxy)
+    POST /scale with JSON body:
+    {
+        "scale": 3,
+        "proxies": ["ip:port:user:pass", "ip:port:user:pass", ...]
+    }
+    """
+    try:
+        # Handle GET or POST
+        if request.method == 'POST':
+            data = request.json or {}
+            scale = int(data.get('scale', -1))
+            proxies = data.get('proxies', [])
+        else:
+            scale = int(request.args.get('scale', -1))
+            proxies = []
+        
+        if scale < 0:
+            return jsonify({'error': 'scale must be >= 0'}), 400
+        
+        # Get current active workers
+        current_workers = count_active_workers()
+        
+        # Get worker PIDs from heartbeat files
+        worker_pids = []
+        current_time = time.time()
+        for heartbeat_file in Path(WORKER_DIR).glob('worker_*_heartbeat.json'):
+            try:
+                heartbeat_data = load_json_file(str(heartbeat_file), {})
+                timestamp = heartbeat_data.get('timestamp', 0)
+                pid = heartbeat_data.get('pid')
+                
+                if current_time - timestamp < HEARTBEAT_TIMEOUT and pid:
+                    worker_pids.append(pid)
+            except:
+                pass
+        
+        # Calculate difference
+        diff = scale - current_workers
+        
+        # SCALE UP - Start more workers
+        if diff > 0:
+            project_dir = os.path.dirname(os.path.abspath(__file__))
+            venv_python = os.path.join(project_dir, '.venv', 'bin', 'python3')
+            worker_script = os.path.join(project_dir, 'worker.py')
+            
+            started_pids = []
+            started_proxies = []
+            
+            for i in range(diff):
+                # Get proxy for this worker (if available)
+                proxy = proxies[i] if i < len(proxies) else None
+                
+                # Build command
+                cmd = [venv_python, worker_script]
+                if proxy:
+                    cmd.extend(['--proxy', proxy])
+                
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    cwd=project_dir
+                )
+                started_pids.append(process.pid)
+                started_proxies.append(proxy if proxy else "no proxy")
+            
+            time.sleep(2)
+            new_worker_count = count_active_workers()
+            
+            return jsonify({
+                'message': f'Started {diff} workers',
+                'requested_scale': scale,
+                'previous_workers': current_workers,
+                'active_workers': new_worker_count,
+                'workers_started': diff,
+                'started_pids': started_pids,
+                'proxies_assigned': started_proxies
+            })
+        
+        # SCALE DOWN - Kill workers
+        elif diff < 0:
+            workers_to_kill = abs(diff)
+            killed_pids = []
+            
+            for i in range(min(workers_to_kill, len(worker_pids))):
+                pid = worker_pids[i]
+                try:
+                    os.kill(pid, 15)  # SIGTERM for graceful shutdown
+                    killed_pids.append(pid)
+                except:
+                    pass
+            
+            time.sleep(2)
+            new_worker_count = count_active_workers()
+            
+            return jsonify({
+                'message': f'Killed {len(killed_pids)} workers',
+                'requested_scale': scale,
+                'previous_workers': current_workers,
+                'active_workers': new_worker_count,
+                'workers_killed': len(killed_pids),
+                'killed_pids': killed_pids
+            })
+        
+        # NO CHANGE
+        else:
+            return jsonify({
+                'message': f'Already at scale {scale}',
+                'requested_scale': scale,
+                'active_workers': current_workers,
+                'workers_changed': 0
+            })
+        
+    except ValueError:
+        return jsonify({'error': 'scale must be a valid integer'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ============================================================================
@@ -215,8 +405,6 @@ if __name__ == '__main__':
         save_json_file(QUEUE_FILE, [])
     if not Path(RESULTS_FILE).exists():
         save_json_file(RESULTS_FILE, {'completed': [], 'failed': []})
-    if not Path(STATUS_FILE).exists():
-        save_json_file(STATUS_FILE, {'status': 'stopped', 'last_heartbeat': None})
     
     print("✅ Server ready!")
     print("=" * 80)
