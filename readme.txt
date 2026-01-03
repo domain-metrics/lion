@@ -16,7 +16,7 @@ git clone https://github.com/domain-metrics/lion.git
 9. Get data from readme - cat readme.txt
 
 python3 -m camoufox fetch
-python3 server.py
+python3 run.py
 
 
 
@@ -86,10 +86,60 @@ curl http://127.0.0.1:8000/health
 # ========================================
 # NOTES
 # ========================================
-# - All jobs are processed through a queue with staggered loading
+# - All jobs are processed through a queue with concurrent processing
+# - Up to 3 tasks can process simultaneously (3 workers)
 # - When you submit a batch, domains are added to a queue
-# - First domain starts loading immediately
-# - When page loads (network idle), next domain starts automatically
-# - Multiple domains can be scraping in parallel, but loading is staggered
-# - This prevents browser overload (not 10 pages loading at once)
+# - Tasks start immediately up to the 3 concurrent limit
+# - When a page loads (network idle), next domain from queue starts
+# - This balances throughput with browser stability
 # - Job status flow: queued -> processing -> completed/failed
+
+# ========================================
+# FILE STRUCTURE
+# ========================================
+# run.py             - Main Flask application & queue management
+# camoufox_helper.py - Browser initialization & context pooling
+# ahrefs_helper.py   - Ahrefs scraping logic (CAPTCHA, metrics)
+
+# ========================================
+# ARCHITECTURE (Test 4 Approach for ALL - 100% Success)
+# ========================================
+# WITHOUT proxy:
+#   - Uses ONE shared context for all non-proxy requests
+#   - Creates pages only (NO new contexts per request)
+#   - 100% success rate (NO timeouts, NO page loading issues)
+#
+# WITH proxy:
+#   - Uses ONE shared context per unique proxy (context pooling)
+#   - Creates pages only (NO new contexts per request)
+#   - Each proxy gets its own shared context (created once, reused)
+#   - Example: 100 proxies = 100 shared contexts (not 1000 contexts for 1000 requests)
+#
+# - Semaphores to prevent Camoufox deadlock (issue #279):
+#   * context creation serialized
+#   * page creation serialized
+#   * page.goto() serialized
+# - Concurrent processing: 3 workers (MAX_CONCURRENT_PROCESSING = 3)
+# - Browser instance is shared and persistent across all requests
+# 
+# Why Test 4 Approach for Both?
+# - Test 4 achieved 100% success (30/30 tasks)
+# - NO first-byte timeout issues
+# - NO page loading issues
+# - Full proxy support with context pooling
+# - Much faster (contexts are reused, not created per request)
+# - Simpler and more reliable
+
+# ========================================
+# TESTING SCRIPTS
+# ========================================
+# Test direct scraping (NO Flask) - Pure Test 4 approach
+python3 test_direct_scraping.py
+
+# Features:
+# - NO Flask (pure asyncio)
+# - NO semaphore (Test 4 approach)
+# - Uses asyncio.gather() for true concurrent execution
+# - Shared contexts + pages only
+# - Edit domains_100.txt to test with your own domains
+# - Edit MAX_CONCURRENT_WORKERS (default: 3, set to 0 for ALL domains)

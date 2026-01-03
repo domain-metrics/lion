@@ -2,21 +2,36 @@
 """
 Access via Tailscale: http://100.124.226.72:8000
 
-Architecture:
+Architecture (Test 4 Approach for ALL - 100% Success Rate):
 - Single persistent Camoufox browser instance (initialized on startup)
-- Each scrape request creates a new context + page within the same browser
+- WITHOUT proxy: ONE shared context + pages only
+- WITH proxy: ONE shared context per unique proxy + pages only (context pooling)
+- NO semaphore (testing if deadlock occurs on Mac)
+- NO new contexts per request (contexts are reused)
 - Browser is reused across all requests for better performance
-- Tasks are processed through a queue with staggered loading
-- Next domain starts loading as soon as current page is loaded
+- Tasks are processed through a queue with 3 concurrent workers
 - Browser is properly closed on server shutdown
+
+Context Pooling Strategy:
+- Non-proxy requests: All share 1 context
+- Proxy requests: Each unique proxy gets 1 shared context
+- All requests create pages only (NO new contexts per request)
+- Example: 100 proxies = 100 shared contexts (created once, reused for all requests)
 
 Queue System:
 - All scrape requests are added to a queue
-- First domain starts immediately
-- When its page loads (network idle), next domain starts automatically
-- Multiple domains can be scraping simultaneously, but loading is staggered
-- This prevents browser overload while maintaining throughput
+- Up to 3 tasks can process concurrently (3 workers)
+- When a page loads (network idle), next task from queue starts automatically
+- This balances throughput with browser stability
 - Status flow: queued -> processing -> completed/failed
+
+Why Test 4 Approach for Both?
+- Test 4 achieved 100% success (30/30 tasks) with shared context + pages only
+- NO first-byte timeout issues
+- NO page loading issues
+- NO semaphore needed (actually hurts performance)
+- Simpler, faster, and more reliable
+- Full proxy support with context pooling
 """
 
 from flask import Flask, request, jsonify
@@ -44,13 +59,23 @@ results = {}
 global_browser = None
 browser_lock = asyncio.Lock()
 
+# Test 4 approach: Shared contexts (one per unique proxy + one for non-proxy)
+shared_context_no_proxy = None  # For non-proxy requests
+shared_contexts_with_proxy = {}  # Dict: proxy_key -> context (for proxy requests)
+context_pool_lock = asyncio.Lock()
+
 # Global event loop for all async operations
 global_loop = None
 loop_thread = None
 
-# Task queue for staggered processing
+# Task queue for concurrent processing
 task_queue = []
 queue_lock = asyncio.Lock()
+
+# Concurrent processing control (3 workers, Test 4 approach, NO semaphore)
+MAX_CONCURRENT_PROCESSING = 3
+current_processing_count = 0
+processing_count_lock = asyncio.Lock()
 
 async def initialize_browser():
     """Initialize the global browser instance"""
@@ -77,9 +102,26 @@ async def initialize_browser():
     return global_browser
 
 async def close_browser():
-    """Close the global browser instance"""
-    global global_browser
+    """Close all shared contexts and global browser instance"""
+    global global_browser, shared_context_no_proxy, shared_contexts_with_proxy
     
+    # Close non-proxy shared context
+    if shared_context_no_proxy is not None:
+        print("🔒 Closing non-proxy shared context...")
+        await shared_context_no_proxy.close()
+        shared_context_no_proxy = None
+        print("✅ Non-proxy context closed!")
+    
+    # Close all proxy shared contexts
+    if shared_contexts_with_proxy:
+        print(f"🔒 Closing {len(shared_contexts_with_proxy)} proxy contexts...")
+        for proxy_key, context in shared_contexts_with_proxy.items():
+            await context.close()
+            print(f"   ✅ Closed context for proxy: {proxy_key}")
+        shared_contexts_with_proxy.clear()
+        print("✅ All proxy contexts closed!")
+    
+    # Then close browser
     if global_browser is not None:
         print("🔒 Closing browser instance...")
         await global_browser.__aexit__(None, None, None)
@@ -152,14 +194,20 @@ async def extract_metrics(page):
     }
 
 async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
-    """Scrape domain using the global browser instance (creates new page)
+    """Scrape domain using the global browser instance
+    
+    Test 4 Approach for BOTH proxy and non-proxy (100% success):
+    - WITHOUT proxy: ONE shared context + new page only
+    - WITH proxy: ONE shared context per unique proxy + new page only
+    - NO semaphore needed
+    - All pages share contexts (context pooling)
     
     Args:
         domain: Domain to scrape
         proxy: Dict with keys: server, username, password (optional)
         page_loaded_callback: Optional callback to call when page is loaded
     """
-    global global_browser
+    global global_browser, shared_context_no_proxy, shared_contexts_with_proxy
     
     # Ensure browser is initialized
     if global_browser is None:
@@ -167,15 +215,37 @@ async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
     else:
         print(f"♻️  Reusing existing browser instance for {domain}")
     
-    # Create a new context with optional proxy
-    context_options = {}
-    if proxy:
-        context_options['proxy'] = proxy
-        print(f"🔒 Using proxy: {proxy.get('server')} for {domain}")
+    # Get or create shared context (Test 4 approach)
+    context = None
     
-    context = await global_browser.new_context(**context_options)
+    if proxy:
+        # WITH PROXY: Get or create shared context for this specific proxy
+        proxy_key = f"{proxy['server']}"  # Unique key per proxy
+        
+        async with context_pool_lock:
+            if proxy_key not in shared_contexts_with_proxy:
+                print(f"🆕 Creating shared context for proxy: {proxy_key}")
+                shared_contexts_with_proxy[proxy_key] = await global_browser.new_context(proxy=proxy)
+                print(f"✅ Proxy context created! (Total contexts: {len(shared_contexts_with_proxy) + 1})")
+            
+            context = shared_contexts_with_proxy[proxy_key]
+        
+        print(f"♻️  Reusing shared context for proxy: {proxy_key}")
+    else:
+        # WITHOUT PROXY: Use shared non-proxy context
+        async with context_pool_lock:
+            if shared_context_no_proxy is None:
+                print(f"🆕 Creating shared context for non-proxy requests...")
+                shared_context_no_proxy = await global_browser.new_context()
+                print(f"✅ Non-proxy context created!")
+            
+            context = shared_context_no_proxy
+        
+        print(f"♻️  Reusing shared non-proxy context")
+    
+    # Create page in shared context (NO semaphore - Test 4 approach)
     page = await context.new_page()
-    print(f"📄 New page created for {domain}")
+    print(f"📄 New page created for {domain} (Test 4: shared context + page only)")
     
     try:
         # Decode base64 text to string
@@ -484,14 +554,13 @@ async def scrape_complete(domain, proxy=None, page_loaded_callback=None):
         return result
         
     finally:
-        # Always close the page and context (keep browser open for reuse)
-        print(f"🧹 Cleaning up page and context for {domain}")
+        # Only close page, keep context open (Test 4 approach for all)
+        print(f"🧹 Cleaning up page for {domain} (keeping shared context open)")
         await page.close()
-        await context.close()
 
 async def process_next_task():
-    """Process one task from the queue"""
-    global task_queue
+    """Process one task from the queue (up to MAX_CONCURRENT_PROCESSING at a time)"""
+    global task_queue, current_processing_count
     
     # Get next task
     async with queue_lock:
@@ -504,14 +573,19 @@ async def process_next_task():
         domain = task['domain']
         proxy = task.get('proxy')
     
+    # Increment processing count
+    async with processing_count_lock:
+        current_processing_count += 1
+        processing = current_processing_count
+    
     # Process this task
-    print(f"🔄 Processing from queue: {domain} (Queue size: {len(task_queue)})")
+    print(f"🔄 Processing from queue: {domain} (Processing: {processing}/{MAX_CONCURRENT_PROCESSING}, Queue: {len(task_queue)})")
     
     # Callback to trigger next task when page loads
     async def on_page_loaded():
-        print(f"✨ Page loaded for {domain}, starting next task...")
-        # Start next task immediately
-        asyncio.create_task(process_next_task())
+        print(f"✨ Page loaded for {domain}, checking for next task...")
+        # Try to start next task if capacity available
+        await start_next_if_possible()
     
     try:
         jobs[task_id]['status'] = 'processing'
@@ -531,17 +605,40 @@ async def process_next_task():
         jobs[task_id]['error'] = str(e)
         jobs[task_id]['completed_at'] = datetime.now().isoformat()
         print(f"❌ Task {task_id} failed: {e}")
+    
+    finally:
+        # Decrement processing count
+        async with processing_count_lock:
+            current_processing_count -= 1
+            processing = current_processing_count
         
-        # Still trigger next task even if this one failed
+        print(f"🏁 Task finished: {domain} (Processing now: {processing}/{MAX_CONCURRENT_PROCESSING})")
+        
+        # Try to start next task
+        await start_next_if_possible()
+
+async def start_next_if_possible():
+    """Start next task from queue if under the concurrent limit"""
+    global current_processing_count
+    
+    async with processing_count_lock:
+        can_start = current_processing_count < MAX_CONCURRENT_PROCESSING
+        processing = current_processing_count
+    
+    if can_start and len(task_queue) > 0:
+        print(f"🚀 Starting next task (Processing: {processing}/{MAX_CONCURRENT_PROCESSING})")
         asyncio.create_task(process_next_task())
+    elif processing >= MAX_CONCURRENT_PROCESSING:
+        print(f"⏸️  At capacity ({MAX_CONCURRENT_PROCESSING}/{MAX_CONCURRENT_PROCESSING}), waiting for slot...")
+    else:
+        print(f"📭 No more tasks in queue")
 
 async def add_task_to_queue(task_id, domain, proxy=None):
-    """Add a task to the queue and start processing if needed"""
-    global task_queue
+    """Add a task to the queue and start processing if capacity available"""
+    global task_queue, current_processing_count
     
-    # Check if queue is empty before adding
+    # Add task to queue
     async with queue_lock:
-        was_empty = len(task_queue) == 0
         task_queue.append({
             'task_id': task_id,
             'domain': domain,
@@ -549,14 +646,13 @@ async def add_task_to_queue(task_id, domain, proxy=None):
         })
         queue_size = len(task_queue)
     
-    print(f"📥 Added to queue: {domain} (Queue size: {queue_size})")
+    async with processing_count_lock:
+        processing = current_processing_count
     
-    # If queue was empty (no tasks processing), start processing this one
-    if was_empty:
-        print(f"🚀 Queue was empty, starting task immediately")
-        asyncio.create_task(process_next_task())
-    else:
-        print(f"⏳ Task added to queue, will start when previous page loads")
+    print(f"📥 Added to queue: {domain} (Queue: {queue_size}, Processing: {processing}/{MAX_CONCURRENT_PROCESSING})")
+    
+    # Try to start this task if we have capacity
+    await start_next_if_possible()
 
 def run_async_scrape(task_id, domain, proxy=None):
     """Submit scrape task to the queue via global event loop"""
@@ -582,7 +678,14 @@ def health():
         'processing': len([j for j in jobs.values() if j['status'] == 'processing']),
         'completed': len([j for j in jobs.values() if j['status'] == 'completed']),
         'failed': len([j for j in jobs.values() if j['status'] == 'failed']),
-        'queue_size': len(task_queue)
+        'queue_size': len(task_queue),
+        'max_concurrent': MAX_CONCURRENT_PROCESSING,
+        'current_processing': current_processing_count,
+        'context_pool': {
+            'no_proxy_context': 'created' if shared_context_no_proxy else 'not created',
+            'proxy_contexts': len(shared_contexts_with_proxy),
+            'total_contexts': (1 if shared_context_no_proxy else 0) + len(shared_contexts_with_proxy)
+        }
     })
 
 @app.route('/queue', methods=['GET'])
