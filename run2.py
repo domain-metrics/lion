@@ -24,11 +24,16 @@ app = Flask(__name__)
 # Configuration
 MAX_CONCURRENT_PROCESSING = 4  # Number of concurrent workers
 DEBUG = False  # Set to True for verbose logging
+MAX_TIMEOUT_ERRORS = 5  # Restart browser after this many timeout errors
 
 # Queue and processing state
 task_queue = []
 current_processing_count = 0
 processing_count_lock = threading.Lock()
+
+# Error tracking
+timeout_error_count = 0
+timeout_error_lock = threading.Lock()
 
 # Global event loop and thread
 global_loop = None
@@ -54,7 +59,106 @@ def parse_proxy(proxy_string):
     return None
 
 
+async def restart_browser():
+    """Restart the browser (close and reinitialize)"""
+    global timeout_error_count
+    
+    print("\n" + "=" * 80)
+    print("⚠️  RESTARTING BROWSER DUE TO TIMEOUT ERRORS")
+    print("=" * 80)
+    
+    try:
+        # Close existing browser
+        await close_browser()
+        print("✅ Old browser closed")
+        
+        # Wait a bit
+        await asyncio.sleep(3)
+        
+        # Reinitialize
+        await initialize_browser()
+        print("✅ New browser initialized")
+        
+        # Reset error counter
+        with timeout_error_lock:
+            timeout_error_count = 0
+        
+        print("=" * 80)
+        print("✅ BROWSER RESTART COMPLETE")
+        print("=" * 80 + "\n")
+        
+    except Exception as e:
+        print(f"❌ Browser restart failed: {str(e)}")
+        # Reset counter anyway to avoid infinite restart loop
+        with timeout_error_lock:
+            timeout_error_count = 0
+
+
 async def extract_metrics(page):
+    """Extract DR, backlinks, and linking websites from Ahrefs page"""
+    metrics = await page.evaluate("""
+        () => {
+            let dr = null;
+            let backlinks = null;
+            let linkingWebsites = null;
+            
+            const allElements = Array.from(document.querySelectorAll('*'));
+            
+            const drLabel = allElements.find(el => el.textContent.trim() === 'Domain Rating');
+            const backlinksLabel = allElements.find(el => el.textContent.trim() === 'Backlinks');
+            const linkingLabel = allElements.find(el => el.textContent.trim() === 'Linking websites');
+            
+            const findNumber = (label) => {
+                if (!label) return null;
+                
+                let parent = label;
+                for (let i = 0; i < 8; i++) {
+                    parent = parent.parentElement;
+                    if (!parent) break;
+                    
+                    const spans = parent.querySelectorAll('span');
+                    for (const span of spans) {
+                        const text = span.textContent.trim();
+                        const fontSize = window.getComputedStyle(span).fontSize;
+                        
+                        if (text && /^[0-9.,KM]+$/.test(text) && parseFloat(fontSize) > 25) {
+                            return text;
+                        }
+                    }
+                }
+                return null;
+            };
+            
+            dr = findNumber(drLabel);
+            backlinks = findNumber(backlinksLabel);
+            linkingWebsites = findNumber(linkingLabel);
+            
+            return {
+                _dr: dr,
+                backlinks: backlinks,
+                linking_websites: linkingWebsites
+            };
+        }
+    """)
+    
+    def convert_to_int(value):
+        if not value:
+            return None
+        
+        value = str(value).replace(',', '')
+        
+        if 'K' in value:
+            return int(float(value.replace('K', '')) * 1000)
+        elif 'M' in value:
+            return int(float(value.replace('M', '')) * 1000000)
+        else:
+            return int(float(value))
+    
+    return {
+        '_dr': convert_to_int(metrics['_dr']),
+        'backlinks': convert_to_int(metrics['backlinks']),
+        'linking_websites': convert_to_int(metrics['linking_websites'])
+    }
     """Extract DR, backlinks, and linking websites from Ahrefs page"""
     metrics = await page.evaluate("""
         () => {
@@ -365,6 +469,7 @@ async def simple_page_load(domain, proxy=None):
     """
     Ahrefs page loading with CAPTCHA solving and metrics extraction
     """
+    global timeout_error_count
     start_time = time.time()
     
     try:
@@ -390,6 +495,11 @@ async def simple_page_load(domain, proxy=None):
                     if DEBUG:
                         print(f"[{domain}] ✅ Page first byte received")
                     await page.wait_for_load_state('networkidle', timeout=90000)
+                    
+                    # Success - reset timeout counter on successful navigation
+                    with timeout_error_lock:
+                        if timeout_error_count > 0:
+                            timeout_error_count = max(0, timeout_error_count - 1)
                     
                     # Wait for page to settle
                     await asyncio.sleep(10)
@@ -451,9 +561,27 @@ async def simple_page_load(domain, proxy=None):
                     }
                     
                     return result
+                    
                 except Exception as e:
+                    error_str = str(e)
+                    
+                    # Check if it's a timeout error
+                    is_timeout = 'Timeout' in error_str or 'timeout' in error_str
+                    
+                    if is_timeout:
+                        # Increment timeout counter
+                        with timeout_error_lock:
+                            timeout_error_count += 1
+                            current_count = timeout_error_count
+                        
+                        # Check if we need to restart browser
+                        if current_count >= MAX_TIMEOUT_ERRORS:
+                            print(f"\n⚠️  Timeout error #{current_count} detected - triggering browser restart...")
+                            asyncio.create_task(restart_browser())
+                    
                     if DEBUG:
-                        print(f"[{domain}] ⚠️  Error on try {attempt + 1}: {str(e)[:50]}")
+                        print(f"[{domain}] ⚠️  Error on try {attempt + 1}: {error_str[:50]}")
+                    
                     if attempt < try_count - 1:
                         await asyncio.sleep(1)
                         continue
@@ -601,14 +729,31 @@ def batch_load():
 
 @app.route('/queue', methods=['GET'])
 def get_queue_status():
-    """Get current queue status"""
+    """Get current queue status with detailed information"""
+    # Get domains in queue
+    queued_domains = [task['domain'] for task in task_queue]
+    
     return jsonify({
         'queue_length': len(task_queue),
         'processing_count': current_processing_count,
         'max_concurrent': MAX_CONCURRENT_PROCESSING,
         'completed_count': len(completed_tasks),
         'failed_count': len(failed_tasks),
-        'context_pool': get_context_pool_stats()
+        'queued_domains': queued_domains,
+        'context_pool': get_context_pool_stats(),
+        'timeout_errors': timeout_error_count,
+        'max_timeout_errors': MAX_TIMEOUT_ERRORS
+    })
+
+
+@app.route('/queue/details', methods=['GET'])
+def get_queue_details():
+    """Get detailed queue information including full task data"""
+    return jsonify({
+        'queue': task_queue,
+        'queue_length': len(task_queue),
+        'processing_count': current_processing_count,
+        'max_concurrent': MAX_CONCURRENT_PROCESSING
     })
 
 
@@ -628,7 +773,9 @@ def health():
     return jsonify({
         'status': 'healthy',
         'queue_length': len(task_queue),
-        'processing_count': current_processing_count
+        'processing_count': current_processing_count,
+        'timeout_errors': timeout_error_count,
+        'max_timeout_errors': MAX_TIMEOUT_ERRORS
     })
 
 
@@ -667,6 +814,7 @@ def startup():
     print(f"Test approach: Queue-based concurrent page loading")
     print(f"Camoufox bug fix: Context/page creation serialized (Test 4)")
     print(f"CAPTCHA: Computer vision detection (OpenCV)")
+    print(f"Auto-restart: After {MAX_TIMEOUT_ERRORS} timeout errors")
     print("=" * 80)
     
     # Create and start event loop in separate thread

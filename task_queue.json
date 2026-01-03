@@ -1,0 +1,32 @@
+[
+  {
+    "domain": "producthunt.com",
+    "proxy": null,
+    "added_at": "2026-01-03T15:14:20.358986",
+    "status": "processing"
+  },
+  {
+    "domain": "discord.com",
+    "proxy": null,
+    "added_at": "2026-01-03T15:14:20.358987",
+    "status": "processing"
+  },
+  {
+    "domain": "linkedin.com",
+    "proxy": null,
+    "added_at": "2026-01-03T15:14:20.358989",
+    "status": "processing"
+  },
+  {
+    "domain": "youtube.com",
+    "proxy": null,
+    "added_at": "2026-01-03T15:14:20.358990",
+    "status": "processing"
+  },
+  {
+    "domain": "google.com",
+    "proxy": null,
+    "added_at": "2026-01-03T15:14:20.358991",
+    "status": "queued"
+  }
+]

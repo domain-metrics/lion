@@ -1,0 +1,309 @@
+================================================================================
+SEPARATED ARCHITECTURE: Flask Server + Worker
+================================================================================
+
+✅ BENEFIT: Browser restarts don't kill HTTP requests!
+
+================================================================================
+ARCHITECTURE
+================================================================================
+
+┌─────────────────┐        ┌──────────────┐        ┌─────────────┐
+│  HTTP Requests  │───────▶│ Flask Server │───────▶│    Queue    │
+│  (curl/API)     │        │ (port 5001)  │        │ (JSON file) │
+└─────────────────┘        └──────────────┘        └─────────────┘
+                                                           │
+                                                           ▼
+                                                    ┌─────────────┐
+                                                    │   Worker    │
+                                                    │  (Browser)  │
+                                                    └─────────────┘
+                                                           │
+                                                           ▼
+                                                    ┌─────────────┐
+                                                    │   Results   │
+                                                    │ (JSON file) │
+                                                    └─────────────┘
+
+================================================================================
+FILES
+================================================================================
+
+1. flask_server.py  - HTTP API (adds tasks to queue)
+2. worker.py        - Background worker (processes queue)
+3. task_queue.json  - Shared queue (auto-created)
+4. results.json     - Results storage (auto-created)
+5. worker_status.json - Worker health status (auto-created)
+
+================================================================================
+QUICK START
+================================================================================
+
+Terminal 1 - Start Flask Server:
+```bash
+cd /path/to/project
+source .venv/bin/activate
+python3 flask_server.py
+```
+
+Terminal 2 - Start Worker:
+```bash
+cd /path/to/project
+source .venv/bin/activate
+python3 worker.py
+```
+
+Terminal 3 - Send Requests:
+```bash
+curl -X POST http://localhost:5001/batch \
+  -H "Content-Type: application/json" \
+  -d '{"domains": ["example.com", "github.com"]}'
+```
+
+================================================================================
+HOW IT WORKS
+================================================================================
+
+1. **Flask Server** (flask_server.py)
+   - Receives HTTP requests
+   - Adds tasks to task_queue.json
+   - Returns immediately
+   - NEVER touches the browser
+   - Can't be killed by browser issues
+
+2. **Worker** (worker.py)
+   - Polls task_queue.json every 2 seconds
+   - Processes up to 4 domains concurrently
+   - Saves results to results.json
+   - Can restart browser without affecting Flask
+   - Updates worker_status.json (heartbeat)
+
+3. **Queue** (task_queue.json)
+   - Shared file between server and worker
+   - Each task has: domain, proxy, status (queued/processing)
+   - Atomic file operations (safe for concurrent access)
+
+4. **Results** (results.json)
+   - Completed and failed tasks
+   - DR, backlinks, linking_websites
+   - Timestamps and errors
+
+5. **Status** (worker_status.json)
+   - Worker health status
+   - Last heartbeat time
+   - Current processing count
+   - Timeout error count
+
+================================================================================
+API ENDPOINTS
+================================================================================
+
+POST /load
+----------
+Add single domain to queue
+```bash
+curl -X POST http://localhost:5001/load \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "example.com"}'
+```
+
+POST /batch
+-----------
+Add multiple domains to queue
+```bash
+curl -X POST http://localhost:5001/batch \
+  -H "Content-Type: application/json" \
+  -d '{"domains": ["example.com", "github.com"]}'
+```
+
+GET /queue
+----------
+Get queue status
+```bash
+curl http://localhost:5001/queue | python3 -m json.tool
+```
+
+Response:
+```json
+{
+  "queue_length": 10,
+  "processing_count": 4,
+  "queued_domains": ["example.com", "github.com"],
+  "processing_domains": ["stackoverflow.com"],
+  "completed_count": 25,
+  "failed_count": 3,
+  "worker_status": {
+    "status": "running",
+    "last_heartbeat": "2026-01-03T13:45:00"
+  }
+}
+```
+
+GET /results
+------------
+Get all results
+```bash
+curl http://localhost:5001/results | python3 -m json.tool
+```
+
+POST /results/clear
+-------------------
+Clear all results
+```bash
+curl -X POST http://localhost:5001/results/clear
+```
+
+POST /queue/clear
+-----------------
+Clear the queue
+```bash
+curl -X POST http://localhost:5001/queue/clear
+```
+
+GET /health
+-----------
+Health check
+```bash
+curl http://localhost:5001/health | python3 -m json.tool
+```
+
+================================================================================
+BENEFITS OF SEPARATED ARCHITECTURE
+================================================================================
+
+✅ **Browser Restart Doesn't Kill Requests**
+   - Flask server keeps running
+   - Requests keep being accepted
+   - No "Target page, context or browser has been closed" errors
+
+✅ **Independent Scaling**
+   - Run 1 Flask server + multiple workers
+   - Each worker can process different proxies
+   - Scale workers up/down independently
+
+✅ **Better Reliability**
+   - Server crashes don't affect queue
+   - Worker crashes don't affect server
+   - Can restart either independently
+
+✅ **Cleaner Architecture**
+   - Clear separation of concerns
+   - Easier to debug
+   - Easier to test
+
+✅ **File-Based Queue**
+   - No Redis/database needed
+   - Works out of the box
+   - Easy to inspect (JSON files)
+
+================================================================================
+MONITORING
+================================================================================
+
+Watch Queue in Real-Time:
+```bash
+watch -n 2 'cat task_queue.json | python3 -m json.tool'
+```
+
+Watch Results:
+```bash
+watch -n 2 'cat results.json | python3 -m json.tool | head -50'
+```
+
+Watch Worker Status:
+```bash
+watch -n 2 'cat worker_status.json | python3 -m json.tool'
+```
+
+Worker Logs:
+```bash
+python3 worker.py 2>&1 | tee worker.log
+```
+
+================================================================================
+CONFIGURATION
+================================================================================
+
+Flask Server (flask_server.py):
+- PORT: Line 179 (default: 5001)
+
+Worker (worker.py):
+- MAX_CONCURRENT_PROCESSING: Line 17 (default: 4)
+- DEBUG: Line 18 (default: False)
+- MAX_TIMEOUT_ERRORS: Line 19 (default: 5)
+- POLL_INTERVAL: Line 23 (default: 2 seconds)
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+**Issue: Worker not processing**
+Check worker status:
+```bash
+cat worker_status.json
+```
+
+If status is "stopped", start worker:
+```bash
+python3 worker.py
+```
+
+**Issue: Queue growing but not processing**
+Check if worker is running:
+```bash
+ps aux | grep worker.py
+```
+
+**Issue: Browser crashes**
+Worker will auto-restart browser after 5 timeout errors.
+Manual restart: Stop worker (Ctrl+C) and start again.
+
+**Issue: JSON file corrupted**
+Delete and restart:
+```bash
+rm task_queue.json results.json worker_status.json
+python3 flask_server.py  # Terminal 1
+python3 worker.py        # Terminal 2
+```
+
+================================================================================
+PRODUCTION DEPLOYMENT
+================================================================================
+
+Use supervisord or systemd to keep both running:
+
+**supervisord.conf:**
+```ini
+[program:flask_server]
+command=/path/to/.venv/bin/python3 flask_server.py
+directory=/path/to/project
+autostart=true
+autorestart=true
+user=youruser
+
+[program:worker]
+command=/path/to/.venv/bin/python3 worker.py
+directory=/path/to/project
+autostart=true
+autorestart=true
+user=youruser
+```
+
+================================================================================
+MIGRATING FROM run2.py
+================================================================================
+
+Old (run2.py):
+- Single process
+- Browser restart kills HTTP requests
+- Hard to scale
+
+New (flask_server.py + worker.py):
+- Two processes
+- Browser restart doesn't affect HTTP
+- Easy to scale (multiple workers)
+
+API is compatible - same endpoints!
+
+================================================================================
+

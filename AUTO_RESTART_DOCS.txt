@@ -1,0 +1,276 @@
+================================================================================
+RUN2.PY - AUTO BROWSER RESTART FEATURE
+================================================================================
+
+✅ ADDED: Automatic browser restart after multiple timeout errors
+
+================================================================================
+HOW IT WORKS
+================================================================================
+
+1. **Timeout Error Tracking**
+   - Counts consecutive timeout errors
+   - Threshold: 5 errors (configurable via MAX_TIMEOUT_ERRORS)
+   - Resets counter on successful page load
+
+2. **Auto Restart Trigger**
+   - When timeout_error_count >= MAX_TIMEOUT_ERRORS
+   - Automatically closes old browser
+   - Waits 3 seconds
+   - Initializes new browser instance
+   - Resets error counter to 0
+
+3. **Smart Counter Management**
+   - Increments on timeout: timeout_error_count++
+   - Decrements on success: timeout_error_count--
+   - Never goes below 0
+   - Thread-safe with timeout_error_lock
+
+================================================================================
+CONFIGURATION
+================================================================================
+
+Edit run2.py to change the threshold:
+
+```python
+# Line 25
+MAX_TIMEOUT_ERRORS = 5  # Restart browser after this many timeout errors
+```
+
+Options:
+- 3-5: Aggressive (restart quickly)
+- 5-10: Balanced (default)
+- 10+: Conservative (tolerate more errors)
+
+================================================================================
+OUTPUT EXAMPLES
+================================================================================
+
+**Normal Operation:**
+```
+✅ example.com                     | DR:   45 | Backlinks:    12500 | Time: 35.2s
+✅ github.com                      | DR:   92 | Backlinks:  2500000 | Time: 42.8s
+```
+
+**Timeout Errors Accumulating:**
+```
+❌ slow-site1.com                  | FAILED in 5.2s - Page.goto: Timeout 1000ms exceeded
+❌ slow-site2.com                  | FAILED in 5.2s - Page.goto: Timeout 1000ms exceeded
+❌ slow-site3.com                  | FAILED in 5.2s - Page.goto: Timeout 1000ms exceeded
+❌ slow-site4.com                  | FAILED in 5.2s - Page.goto: Timeout 1000ms exceeded
+❌ slow-site5.com                  | FAILED in 5.2s - Page.goto: Timeout 1000ms exceeded
+
+⚠️  Timeout error #5 detected - triggering browser restart...
+
+================================================================================
+⚠️  RESTARTING BROWSER DUE TO TIMEOUT ERRORS
+================================================================================
+🔒 Closing browser...
+🔒 Closing non-proxy shared context...
+✅ Non-proxy context closed!
+🔒 Closing browser instance...
+✅ Browser closed!
+✅ Old browser closed
+🚀 Initializing Camoufox browser instance...
+✅ Browser instance ready!
+✅ New browser initialized
+================================================================================
+✅ BROWSER RESTART COMPLETE
+================================================================================
+
+✅ next-site.com                   | DR:   55 | Backlinks:    45000 | Time: 38.1s
+```
+
+================================================================================
+HEALTH CHECK
+================================================================================
+
+Check timeout error count:
+
+```bash
+curl http://localhost:5001/health | python3 -m json.tool
+```
+
+Response:
+```json
+{
+  "status": "healthy",
+  "queue_length": 5,
+  "processing_count": 4,
+  "timeout_errors": 2,
+  "max_timeout_errors": 5
+}
+```
+
+Fields:
+- `timeout_errors`: Current error count
+- `max_timeout_errors`: Threshold for restart
+
+================================================================================
+BENEFITS
+================================================================================
+
+✅ **Self-Healing**
+   - Automatically recovers from browser issues
+   - No manual intervention needed
+
+✅ **Prevents Cascade Failures**
+   - One stuck browser doesn't ruin entire batch
+   - Fresh start after repeated failures
+
+✅ **Network Issues**
+   - Handles temporary network problems
+   - Resets connections
+
+✅ **Memory Leaks**
+   - Clears any accumulated browser state
+   - Fresh memory allocation
+
+✅ **Production Ready**
+   - Runs 24/7 without manual restarts
+   - Self-maintains
+
+================================================================================
+TECHNICAL DETAILS
+================================================================================
+
+**Error Detection:**
+```python
+is_timeout = 'Timeout' in error_str or 'timeout' in error_str
+```
+
+Catches:
+- "Page.goto: Timeout 1000ms exceeded"
+- "Page.wait_for_load_state: Timeout 90000ms exceeded"
+- Any error with "timeout" in message
+
+**Thread Safety:**
+```python
+timeout_error_lock = threading.Lock()
+
+with timeout_error_lock:
+    timeout_error_count += 1
+```
+
+**Decrement on Success:**
+```python
+# After successful page.goto()
+with timeout_error_lock:
+    if timeout_error_count > 0:
+        timeout_error_count = max(0, timeout_error_count - 1)
+```
+
+**Restart Process:**
+1. Close all pages (automatic - kept in contexts)
+2. Close all contexts (non-proxy + proxy contexts)
+3. Close browser instance
+4. Wait 3 seconds (cooldown)
+5. Initialize new browser
+6. Ready for new requests
+
+================================================================================
+WHEN RESTART HAPPENS
+================================================================================
+
+**Scenario 1: Network Issues**
+```
+5 consecutive timeouts → Browser restart → Fresh connections
+```
+
+**Scenario 2: Mixed Success/Failure**
+```
+2 timeouts → 1 success (counter: 1) → 1 success (counter: 0)
+→ No restart (counter reset)
+```
+
+**Scenario 3: Intermittent Issues**
+```
+3 timeouts → 1 success (counter: 2) → 3 more timeouts (counter: 5)
+→ Browser restart triggered
+```
+
+================================================================================
+MONITORING
+================================================================================
+
+**Watch timeout errors in real-time:**
+```bash
+watch -n 2 'curl -s http://localhost:5001/health | python3 -c "import sys, json; d=json.load(sys.stdin); print(f\"Errors: {d[\"timeout_errors\"]}/{d[\"max_timeout_errors\"]}\")"'
+```
+
+Output:
+```
+Errors: 2/5
+```
+
+**Log pattern to watch for:**
+```bash
+tail -f run2_log.txt | grep -E "(Timeout|RESTART)"
+```
+
+================================================================================
+TESTING
+================================================================================
+
+**Test the restart feature:**
+
+1. Lower the threshold (for testing):
+   ```python
+   MAX_TIMEOUT_ERRORS = 2  # Restart after 2 errors
+   ```
+
+2. Send domains that will timeout:
+   ```bash
+   curl -X POST http://localhost:5001/batch \
+     -H "Content-Type: application/json" \
+     -d '{"domains": ["invalid1.xyz", "invalid2.xyz", "invalid3.xyz"]}'
+   ```
+
+3. Observe restart in logs
+
+4. Restore threshold:
+   ```python
+   MAX_TIMEOUT_ERRORS = 5
+   ```
+
+================================================================================
+FILES MODIFIED
+================================================================================
+
+✅ run2.py
+   - Line 25: Added MAX_TIMEOUT_ERRORS config
+   - Lines 31-33: Added timeout_error_count tracking
+   - Lines 65-95: Added restart_browser() function
+   - Lines 427-445: Added timeout detection and counter logic
+   - Line 432: Added success counter decrement
+   - Lines 453-457: Added timeout error increment
+   - Lines 459-461: Added restart trigger
+   - Lines 708-713: Updated /health endpoint
+
+================================================================================
+LIMITATIONS
+================================================================================
+
+⚠️  **During Restart:**
+- Ongoing requests may fail
+- Queue continues to accept new requests
+- New requests wait for restart to complete
+
+⚠️  **Not Caught:**
+- Errors without "timeout" in message
+- Successful responses with wrong data
+- CAPTCHA failures (different error type)
+
+================================================================================
+FUTURE IMPROVEMENTS
+================================================================================
+
+Possible enhancements:
+- Configurable restart strategies (immediate vs delayed)
+- Different thresholds for different error types
+- Scheduled periodic restarts (e.g., every 1000 requests)
+- Browser health checks (memory usage, page count)
+- Graceful restart (wait for current tasks to finish)
+
+================================================================================
+
